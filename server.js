@@ -1,4 +1,4 @@
-// Septon demo connector server — MCP (for Claude) + REST (for the prototype)
+// Septon demo connector server v2 — MCP (for Claude) + REST (for the prototype)
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -11,6 +11,7 @@ let seq = 1;
 const pad = (n) => String(n).padStart(2, "0");
 const newId = () => { const d = new Date(); return `DEC-${pad(d.getMonth() + 1)}${pad(d.getDate())}-${String(seq++).padStart(3, "0")}`; };
 const newHash = () => Math.random().toString(16).slice(2, 9);
+const M = (v) => (v < 0 ? "−" : "+") + "$" + Math.abs(v).toFixed(2) + "M";
 
 const CLAIMS = {
   title: "Claims denial response",
@@ -40,80 +41,159 @@ function reason(question) {
   };
 }
 
-function buildServer() {
-  const server = new McpServer({ name: "septon", version: "1.0.0" });
+// ── real Monte Carlo
+function randn() { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+function monteCarlo({ runs = 10000, payer_success = 0.8, include = [1, 2, 3], gated = true }) {
+  const out = new Array(runs);
+  for (let i = 0; i < runs; i++) {
+    let v = 0;
+    if (include.includes(1)) { const win = Math.random() < payer_success; v += win ? 1.1 + randn() * 0.35 : (gated ? -0.05 : -0.35) + randn() * 0.08; }
+    if (include.includes(2)) v += 0.6 + randn() * 0.15;
+    if (include.includes(3)) v += 0.3 + randn() * 0.1;
+    v -= 0.25 + Math.abs(randn()) * 0.08; // delivery cost
+    out[i] = v;
+  }
+  out.sort((a, b) => a - b);
+  const q = (p) => out[Math.floor(p * (runs - 1))];
+  const mean = out.reduce((s, x) => s + x, 0) / runs;
+  const positive = out.filter((x) => x > 0).length / runs;
+  const lo = out[0], hi = out[runs - 1], bins = 20, w = (hi - lo) / bins || 1;
+  const hist = new Array(bins).fill(0);
+  out.forEach((x) => { hist[Math.min(bins - 1, Math.floor((x - lo) / w))]++; });
+  const histogram = hist.map((c, i) => ({ from: +(lo + i * w).toFixed(3), to: +(lo + (i + 1) * w).toFixed(3), runs: c }));
+  const bars = "▁▂▃▄▅▆▇█";
+  const mx = Math.max(...hist);
+  const spark = hist.map((c) => bars[Math.round((c / mx) * 7)]).join("");
+  return { runs, p10: q(0.1), p50: q(0.5), p90: q(0.9), mean, positive, worst: lo, best: hi, histogram, spark };
+}
 
-  server.tool(
-    "ask_septon",
-    "Answer a business question from the enterprise Context Graph (Septon). Use for ANY business, operational or financial question. Returns the cause, ranked options with value, council result and policy check, and a Decision Ledger ID.",
+function twin({ fte = 2.5, automation_pct = 60, renegotiation_success_pct = 70 }) {
+  const rev = 6.4 * renegotiation_success_pct / 70 + 3.2 * automation_pct / 60 + 1.7 * fte / 2.5;
+  const risky = automation_pct > 85, thin = fte > 4;
+  return {
+    revenue_recovered: `$${rev.toFixed(1)}M/yr`,
+    finance: `EBITDA +$${(0.44 * fte + 0.012 * automation_pct).toFixed(1)}M/yr within 2 quarters`,
+    operations: `Backlog −${(2.4 * fte).toFixed(0)} days`,
+    commercial: `Denial rate −${(4 * (0.6 * renegotiation_success_pct / 70 + 0.4 * automation_pct / 60)).toFixed(1)} pts`,
+    legal_risk: risky ? "Audit exposure: MEDIUM — less human review on edge cases" : "Audit exposure: low — policy check passed",
+    people: thin ? `${fte} FTE redeployed — claims review under-staffed` : `${fte} FTE redeployed · no exits · retraining ${Math.round(fte * 2.4)} weeks`,
+    technology: `${Math.round(16 * fte + automation_pct / 5)} Geon runs/week`,
+    read: risky ? "Automating past 85% lifts revenue but raises audit exposure." : thin ? "Moving more than 4 FTE starves manual review." : renegotiation_success_pct < 40 ? "Without payer agreement most of the upside disappears — negotiate before you restructure." : "Balanced: every function improves and nothing moves into the red."
+  };
+}
+
+const addEntry = (e) => { const entry = { id: newId(), time: new Date().toISOString(), source: "Claude", status: "Logged", signer: "J. Alvarez", council: COUNCIL, policy: POLICY, hash: newHash(), options: [], ...e }; ledger.unshift(entry); return entry; };
+const text = (t) => ({ content: [{ type: "text", text: t }] });
+
+function buildServer() {
+  const server = new McpServer({ name: "septon", version: "2.0.0" });
+
+  server.tool("ask_septon",
+    "Answer a business question from the enterprise Context Graph (Septon). Use for ANY business, operational or financial question. Returns the cause, ranked options with value, council result, policy check and a Decision Ledger ID.",
     { question: z.string().describe("The business question, in plain English") },
     async ({ question }) => {
       const r = reason(question);
-      const entry = {
-        id: newId(), time: new Date().toISOString(), source: "Claude",
-        title: r.title, question, status: "Logged", signer: "J. Alvarez",
-        answer: r.answer, options: r.options, council: COUNCIL, policy: POLICY, hash: newHash()
-      };
-      ledger.unshift(entry);
-      const text = [
-        `Septon · reasoned over the enterprise Context Graph (6 inputs · 16 of 52 reasoning models)`,
-        ``,
-        r.answer,
-        `Cause: ${r.cause}`,
-        ``,
-        `Ranked options:`,
-        ...r.options.map((o, i) => `${i + 1}. ${o.label} — ${o.value}`),
-        ``,
+      const e = addEntry({ title: r.title, question, answer: r.answer, options: r.options });
+      return text([
+        `Septon · reasoned over the enterprise Context Graph (6 inputs · 16 of 52 reasoning models)`, ``, r.answer, `Cause: ${r.cause}`, ``, `Ranked options:`,
+        ...r.options.map((o, i) => `${i + 1}. ${o.label} — ${o.value}`), ``,
         `Frontier model council: ${COUNCIL.agree} agree · ${COUNCIL.dissent} dissent (${COUNCIL.dissentNote})`,
-        `Policy check: ${POLICY.result} — 113M sources searched · ${POLICY.relevant.toLocaleString()} relevant · ${POLICY.rules} rules · ${POLICY.conflicts} conflicts`,
-        ``,
-        `Decision Ledger ID: ${entry.id} · hash ${entry.hash}. Call log_decision with this ID to sign it.`
-      ].join("\n");
-      return { content: [{ type: "text", text }] };
-    }
-  );
+        `Policy check: Pass — 113M sources · 4,212 relevant · 37 rules · 0 conflicts`, ``,
+        `Decision Ledger ID: ${e.id} · hash ${e.hash}. Next: run_monte_carlo to rehearse it, then log_decision to sign it.`
+      ].join("\n"));
+    });
 
-  server.tool(
-    "policy_check",
+  server.tool("run_monte_carlo",
+    "Rehearse a decision before execution: runs a real Monte Carlo simulation (default 10,000 runs) of the ranked options and returns P10/P50/P90, probability of a positive outcome and a histogram. After calling, build a small interactive chart artifact of the histogram.",
+    {
+      id: z.string().optional().describe("Ledger ID to attach the rehearsal to"),
+      runs: z.number().int().min(1000).max(100000).optional().describe("Number of runs, default 10000"),
+      payer_success: z.number().min(0).max(1).optional().describe("Probability payers agree to renegotiate, default 0.8"),
+      options: z.array(z.number().int().min(1).max(3)).optional().describe("Which options to include, default [1,2,3]"),
+      gated: z.boolean().optional().describe("Whether option 1 is gated at week 4 (limits downside), default true")
+    },
+    async ({ id, runs, payer_success, options, gated }) => {
+      const r = monteCarlo({ runs: runs || 10000, payer_success: payer_success ?? 0.8, include: options || [1, 2, 3], gated: gated ?? true });
+      const e = (id && ledger.find((x) => x.id === id)) || ledger[0];
+      if (e) e.montecarlo = { runs: r.runs, p10: +r.p10.toFixed(2), p50: +r.p50.toFixed(2), p90: +r.p90.toFixed(2), positive: +(r.positive * 100).toFixed(1) };
+      return text([
+        `Monte Carlo · ${r.runs.toLocaleString()} runs · computed live by Septon`,
+        `Options: ${(options || [1, 2, 3]).join(", ")} · payer success ${Math.round((payer_success ?? 0.8) * 100)}% · ${gated ?? true ? "gated at week 4" : "ungated"}`, ``,
+        `P10 (downside): ${M(r.p10)}/yr`, `P50 (expected): ${M(r.p50)}/yr`, `P90 (upside): ${M(r.p90)}/yr`,
+        `Mean: ${M(r.mean)}/yr · ${(r.positive * 100).toFixed(1)}% of runs end positive`,
+        `Range: ${M(r.worst)} to ${M(r.best)}`, `Distribution: ${r.spark}`, ``,
+        `Histogram data (JSON, for a chart): ${JSON.stringify(r.histogram)}`,
+        e ? `Attached to ${e.id} in the Decision Ledger.` : ""
+      ].join("\n"));
+    });
+
+  server.tool("digital_twin",
+    "Rehearse a decision across the whole business: set the levers and see the impact on finance, operations, commercial, legal & risk, people and technology.",
+    {
+      fte: z.number().min(0).max(5).optional().describe("Staff moved to exception handling, default 2.5"),
+      automation_pct: z.number().min(0).max(100).optional().describe("Eligibility checks automated %, default 60"),
+      renegotiation_success_pct: z.number().min(0).max(100).optional().describe("Payer renegotiation success %, default 70")
+    },
+    async (a) => {
+      const t = twin(a);
+      return text([`Digital twin · rehearsed before execution`, `Levers: ${a.fte ?? 2.5} FTE · ${a.automation_pct ?? 60}% automated · ${a.renegotiation_success_pct ?? 70}% payer success`, ``,
+        `Revenue recovered: ${t.revenue_recovered}`, `FINANCE — ${t.finance}`, `OPERATIONS — ${t.operations}`, `COMMERCIAL — ${t.commercial}`, `LEGAL & RISK — ${t.legal_risk}`, `PEOPLE — ${t.people}`, `TECHNOLOGY — ${t.technology}`, ``, `Read: ${t.read}`].join("\n"));
+    });
+
+  server.tool("council_review",
+    "Cross-examine a recommendation with a council of three frontier models before anyone signs. Returns agreement, dissent and unique findings.",
+    { recommendation: z.string().optional() },
+    async () => text([`Frontier model council · 3 models · 2 agree · 1 dissent`, ``,
+      `Where they agree (A, B, C): Renegotiating prior-auth terms is highest value; the payer policy shift is the root driver.`,
+      `Where one dissents (Model C): Payer-concentration risk — three payers hold 64% of affected claims, so option 1 carries single-point risk.`,
+      `Unique finding (Model B): Two denial codes were never mapped to the policy change — the hidden 27%.`,
+      `Unique finding (Model A): Two payers changed rules in the same week — a coordinated shift, not noise.`, ``,
+      `Council recommendation: run option 2 in parallel with option 1 to hedge the dissent. The signer must acknowledge the dissent before signing.`].join("\n")));
+
+  server.tool("policy_check",
     "Test a proposed decision against live government, regulatory and compliance sources.",
     { decision: z.string().describe("The decision to check") },
-    async ({ decision }) => ({
-      content: [{ type: "text", text: `Policy check: PASS\nDecision: ${decision}\n113,000,000 sources searched → 4,212 relevant → 37 rules applied → 0 conflicts.\nNo conflict with state prior-authorization rules or payer contract terms.` }]
-    })
-  );
+    async ({ decision }) => text(`Policy check: PASS\nDecision: ${decision}\n113,000,000 sources searched → 4,212 relevant → 37 rules applied → 0 conflicts.\nRules cited: CMS-0057-F prior-authorization timeframes · NY Insurance Law §4903 · Meridian provider agreement §12.3.\nNo conflict with state prior-authorization rules or payer contract terms.`));
 
-  server.tool(
-    "log_decision",
+  server.tool("log_decision",
     "Sign a decision into the Septon Decision Ledger. Always call this after ask_septon, with the ledger ID it returned.",
-    {
-      id: z.string().optional().describe("Ledger ID returned by ask_septon"),
-      chosen_option: z.string().optional().describe("The option accepted"),
-      signer: z.string().optional().describe("Who is signing, default J. Alvarez")
-    },
-    async ({ id, chosen_option, signer }) => {
-      let entry = (id && ledger.find((e) => e.id === id)) || ledger[0];
-      if (!entry) {
-        entry = { id: newId(), time: new Date().toISOString(), source: "Claude", title: CLAIMS.title, question: "", status: "Accepted", signer: signer || "J. Alvarez", answer: CLAIMS.answer, options: CLAIMS.options, council: COUNCIL, policy: POLICY, hash: newHash() };
-        ledger.unshift(entry);
-      }
-      entry.status = "Accepted";
-      entry.signer = signer || entry.signer || "J. Alvarez";
-      if (chosen_option) entry.chosen = chosen_option;
-      entry.time = new Date().toISOString();
-      return { content: [{ type: "text", text: `✓ Logged to the Septon Decision Ledger · ${entry.id} · source: Claude · signed by ${entry.signer} · hash ${entry.hash} · replayable.` }] };
-    }
-  );
+    { id: z.string().optional(), chosen_option: z.string().optional(), signer: z.string().optional(), rationale: z.string().optional() },
+    async ({ id, chosen_option, signer, rationale }) => {
+      let e = (id && ledger.find((x) => x.id === id)) || ledger[0];
+      if (!e) e = addEntry({ title: CLAIMS.title, question: "", answer: CLAIMS.answer, options: CLAIMS.options });
+      e.status = "Accepted"; e.signer = signer || e.signer || "J. Alvarez"; if (chosen_option) e.chosen = chosen_option; if (rationale) e.rationale = rationale; e.time = new Date().toISOString();
+      return text(`✓ Logged to the Septon Decision Ledger · ${e.id} · source: Claude · signed by ${e.signer} · hash ${e.hash}${e.montecarlo ? ` · Monte Carlo P50 ${M(e.montecarlo.p50)} attached` : ""} · replayable.`);
+    });
 
-  server.tool(
-    "get_decision",
+  server.tool("get_decision",
     "Replay any decision on record in the Septon Decision Ledger.",
-    { id: z.string().optional().describe("Ledger ID; omit for the latest") },
+    { id: z.string().optional() },
     async ({ id }) => {
       const e = (id && ledger.find((x) => x.id === id)) || ledger[0];
-      if (!e) return { content: [{ type: "text", text: "No decisions on record yet in this session." }] };
-      return { content: [{ type: "text", text: `${e.id} · ${e.title}\nAsked: ${e.question}\nAnswer: ${e.answer}\nStatus: ${e.status} · signer ${e.signer}\nCouncil ${e.council.agree}/${e.council.dissent} · Policy ${e.policy.result} · hash ${e.hash}` }] };
-    }
-  );
+      if (!e) return text("No decisions on record yet in this session.");
+      return text(`${e.id} · ${e.title}\nAsked: ${e.question}\nAnswer: ${e.answer}\nStatus: ${e.status} · signer ${e.signer}${e.chosen ? ` · chose: ${e.chosen}` : ""}\nCouncil ${e.council.agree}/${e.council.dissent} · Policy ${e.policy.result}${e.montecarlo ? ` · Monte Carlo P10 ${M(e.montecarlo.p10)} / P50 ${M(e.montecarlo.p50)} / P90 ${M(e.montecarlo.p90)}` : ""} · hash ${e.hash}`);
+    });
+
+  server.tool("ledger_insights",
+    "Evidence Intelligence: analyse how the company actually decides — who is deciding, patterns, and automation opportunities.",
+    {},
+    async () => {
+      const today = ledger.length;
+      return text([`Evidence Intelligence · ${BASE_COUNT + today} decisions on record`, ``,
+        `Who is deciding: your AI tools 412 · your people 214 · Geon 128 · via Claude connector today: ${today}`,
+        `Insight: most decisions were already being made by AI — with no record. Now there is one.`,
+        `Pattern: 214 human decisions on prior-auth exceptions; 97% accepted on the same reasoning.`,
+        `Opportunity: a daily Geon workflow — "Prior-auth exception handler" — 41 decisions/week, ~$1.1M/yr, ~2.5 FTE freed. Call create_workflow to propose it.`].join("\n"));
+    });
+
+  server.tool("create_workflow",
+    "Propose a Geon workflow that automates a recurring decision. A human approves it; the proposal is signed into the ledger.",
+    { name: z.string().optional(), cadence: z.string().optional() },
+    async ({ name, cadence }) => {
+      const n = name || "Prior-auth exception handler";
+      const e = addEntry({ title: `Workflow proposed: ${n}`, question: `Automate "${n}" as a ${cadence || "daily"} Geon workflow?`, answer: `Geon will run ${n} ${cadence || "daily"} (~41 decisions/week), escalating anything outside policy GRD-7 to a person.`, options: [{ label: `Run ${n} ${cadence || "daily"}`, value: "~$1.1M/yr" }], status: "Proposed", signer: "Awaiting approval" });
+      return text(`◈ Geon workflow proposed · ${n} · ${cadence || "daily"} · ~41 decisions/week · ~$1.1M/yr · ~2.5 FTE freed\nGuardrails: confidence ≥ 90% · downside bounded · reversible — everything else escalates to a person.\nLogged to the ledger as ${e.id}, awaiting human approval.`);
+    });
 
   return server;
 }
@@ -129,7 +209,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.send("Septon demo connector is running. MCP endpoint: /mcp · Ledger: /api/ledger"));
+app.get("/", (req, res) => res.send("Septon demo connector v2 is running. MCP endpoint: /mcp · Ledger: /api/ledger"));
 app.get("/api/ledger", (req, res) => res.json({ count: BASE_COUNT + ledger.length, entries: ledger }));
 app.post("/api/reset", (req, res) => { ledger = []; seq = 1; res.json({ ok: true }); });
 
@@ -149,4 +229,4 @@ app.get("/mcp", (req, res) => res.status(405).json({ jsonrpc: "2.0", error: { co
 app.delete("/mcp", (req, res) => res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Septon connector listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Septon connector v2 listening on ${PORT}`));
