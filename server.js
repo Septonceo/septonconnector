@@ -1,4 +1,4 @@
-// Septon demo connector server v2 — MCP (for Claude) + REST (for the prototype)
+// Septon demo connector server v3 — deliberate first, sign once — MCP (for Claude) + REST (for the prototype)
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -7,6 +7,8 @@ import { z } from "zod";
 const BASE_COUNT = 754;
 let ledger = [];
 let seq = 1;
+let draft = null; // the decision being deliberated — not in the ledger until signed
+const step = (label) => { if (draft) draft.trail.push({ time: new Date().toISOString(), label }); };
 
 const pad = (n) => String(n).padStart(2, "0");
 const newId = () => { const d = new Date(); return `DEC-${pad(d.getMonth() + 1)}${pad(d.getDate())}-${String(seq++).padStart(3, "0")}`; };
@@ -93,13 +95,16 @@ function buildServer() {
     { question: z.string().describe("The business question, in plain English") },
     async ({ question }) => {
       const r = reason(question);
-      const e = addEntry({ title: r.title, question, answer: r.answer, options: r.options });
+      if (!draft) draft = { title: r.title, question, answer: r.answer, options: r.options, trail: [] };
+      else { draft.answer = r.answer; draft.options = r.options; }
+      step('Asked — "' + question + '"');
+      const e = { id: 'DRAFT', hash: 'pending' };
       return text([
         `Septon · reasoned over the enterprise Context Graph (6 inputs · 16 of 52 reasoning models)`, ``, r.answer, `Cause: ${r.cause}`, ``, `Ranked options:`,
         ...r.options.map((o, i) => `${i + 1}. ${o.label} — ${o.value}`), ``,
         `Frontier model council: ${COUNCIL.agree} agree · ${COUNCIL.dissent} dissent (${COUNCIL.dissentNote})`,
         `Policy check: Pass — 113M sources · 4,212 relevant · 37 rules · 0 conflicts`, ``,
-        `Decision Ledger ID: ${e.id} · hash ${e.hash}. Next: run_monte_carlo to rehearse it, then log_decision to sign it.`
+        `Status: DRAFT — deliberating (${draft.trail.length} step${draft.trail.length > 1 ? 's' : ''} so far). Nothing is in the Decision Ledger yet. Keep exploring; call log_decision only when the user says they have decided.`
       ].join("\n"));
     });
 
@@ -114,7 +119,8 @@ function buildServer() {
     },
     async ({ id, runs, payer_success, options, gated }) => {
       const r = monteCarlo({ runs: runs || 10000, payer_success: payer_success ?? 0.8, include: options || [1, 2, 3], gated: gated ?? true });
-      const e = (id && ledger.find((x) => x.id === id)) || ledger[0];
+      const e = draft || (id && ledger.find((x) => x.id === id)) || ledger[0];
+      step('Rehearsed — Monte Carlo ' + (runs || 10000).toLocaleString() + ' runs · payer success ' + Math.round((payer_success ?? 0.8) * 100) + '% · P50 ' + M(r.p50));
       if (e) e.montecarlo = { runs: r.runs, p10: +r.p10.toFixed(2), p50: +r.p50.toFixed(2), p90: +r.p90.toFixed(2), positive: +(r.positive * 100).toFixed(1) };
       return text([
         `Monte Carlo · ${r.runs.toLocaleString()} runs · computed live by Septon`,
@@ -123,7 +129,7 @@ function buildServer() {
         `Mean: ${M(r.mean)}/yr · ${(r.positive * 100).toFixed(1)}% of runs end positive`,
         `Range: ${M(r.worst)} to ${M(r.best)}`, `Distribution: ${r.spark}`, ``,
         `Histogram data (JSON, for a chart): ${JSON.stringify(r.histogram)}`,
-        e ? `Attached to ${e.id} in the Decision Ledger.` : ""
+        draft ? `Added to the draft decision's deliberation trail.` : (e ? `Attached to ${e.id}.` : "")
       ].join("\n"));
     });
 
@@ -136,6 +142,7 @@ function buildServer() {
     },
     async (a) => {
       const t = twin(a);
+      step('What-if — digital twin · ' + (a.fte ?? 2.5) + ' FTE · ' + (a.automation_pct ?? 60) + '% automated · ' + (a.renegotiation_success_pct ?? 70) + '% payer success');
       return text([`Digital twin · rehearsed before execution`, `Levers: ${a.fte ?? 2.5} FTE · ${a.automation_pct ?? 60}% automated · ${a.renegotiation_success_pct ?? 70}% payer success`, ``,
         `Revenue recovered: ${t.revenue_recovered}`, `FINANCE — ${t.finance}`, `OPERATIONS — ${t.operations}`, `COMMERCIAL — ${t.commercial}`, `LEGAL & RISK — ${t.legal_risk}`, `PEOPLE — ${t.people}`, `TECHNOLOGY — ${t.technology}`, ``, `Read: ${t.read}`].join("\n"));
     });
@@ -143,26 +150,29 @@ function buildServer() {
   server.tool("council_review",
     "Cross-examine a recommendation with a council of three frontier models before anyone signs. Returns agreement, dissent and unique findings.",
     { recommendation: z.string().optional() },
-    async () => text([`Frontier model council · 3 models · 2 agree · 1 dissent`, ``,
+    async () => (step('Council — 3 models · 2 agree · 1 dissent (payer concentration)'), text([`Frontier model council · 3 models · 2 agree · 1 dissent`, ``,
       `Where they agree (A, B, C): Renegotiating prior-auth terms is highest value; the payer policy shift is the root driver.`,
       `Where one dissents (Model C): Payer-concentration risk — three payers hold 64% of affected claims, so option 1 carries single-point risk.`,
       `Unique finding (Model B): Two denial codes were never mapped to the policy change — the hidden 27%.`,
       `Unique finding (Model A): Two payers changed rules in the same week — a coordinated shift, not noise.`, ``,
-      `Council recommendation: run option 2 in parallel with option 1 to hedge the dissent. The signer must acknowledge the dissent before signing.`].join("\n")));
+      `Council recommendation: run option 2 in parallel with option 1 to hedge the dissent. The signer must acknowledge the dissent before signing.`].join("\n"))));
 
   server.tool("policy_check",
     "Test a proposed decision against live government, regulatory and compliance sources.",
     { decision: z.string().describe("The decision to check") },
-    async ({ decision }) => text(`Policy check: PASS\nDecision: ${decision}\n113,000,000 sources searched → 4,212 relevant → 37 rules applied → 0 conflicts.\nRules cited: CMS-0057-F prior-authorization timeframes · NY Insurance Law §4903 · Meridian provider agreement §12.3.\nNo conflict with state prior-authorization rules or payer contract terms.`));
+    async ({ decision }) => (step('Policy check — Pass · 113M sources · 0 conflicts'), text(`Policy check: PASS\nDecision: ${decision}\n113,000,000 sources searched → 4,212 relevant → 37 rules applied → 0 conflicts.\nRules cited: CMS-0057-F prior-authorization timeframes · NY Insurance Law §4903 · Meridian provider agreement §12.3.\nNo conflict with state prior-authorization rules or payer contract terms.`)));
 
   server.tool("log_decision",
-    "Sign a decision into the Septon Decision Ledger. Always call this after ask_septon, with the ledger ID it returned.",
+    "Sign the deliberated decision into the Septon Decision Ledger. ONLY call this when the user explicitly says they have decided (e.g. 'I've decided', 'sign it', 'log it'). Commits the full deliberation trail.",
     { id: z.string().optional(), chosen_option: z.string().optional(), signer: z.string().optional(), rationale: z.string().optional() },
     async ({ id, chosen_option, signer, rationale }) => {
-      let e = (id && ledger.find((x) => x.id === id)) || ledger[0];
-      if (!e) e = addEntry({ title: CLAIMS.title, question: "", answer: CLAIMS.answer, options: CLAIMS.options });
+      let e;
+      if (draft) { e = addEntry({ title: draft.title, question: draft.question, answer: draft.answer, options: draft.options, trail: draft.trail, montecarlo: draft.montecarlo }); draft = null; }
+      else e = (id && ledger.find((x) => x.id === id)) || ledger[0];
+      if (!e) e = addEntry({ title: CLAIMS.title, question: "", answer: CLAIMS.answer, options: CLAIMS.options, trail: [] });
+      (e.trail = e.trail || []).push({ time: new Date().toISOString(), label: 'Signed — ' + (signer || 'J. Alvarez') + (chosen_option ? ' · chose: ' + chosen_option : '') + (rationale ? ' · "' + rationale + '"' : '') });
       e.status = "Accepted"; e.signer = signer || e.signer || "J. Alvarez"; if (chosen_option) e.chosen = chosen_option; if (rationale) e.rationale = rationale; e.time = new Date().toISOString();
-      return text(`✓ Logged to the Septon Decision Ledger · ${e.id} · source: Claude · signed by ${e.signer} · hash ${e.hash}${e.montecarlo ? ` · Monte Carlo P50 ${M(e.montecarlo.p50)} attached` : ""} · replayable.`);
+      return text(`✓ Logged to the Septon Decision Ledger · ${e.id} · source: Claude · signed by ${e.signer} · hash ${e.hash} · ${e.trail.length} deliberation steps captured${e.montecarlo ? ` · Monte Carlo P50 ${M(e.montecarlo.p50)} attached` : ""} · replayable.`);
     });
 
   server.tool("get_decision",
@@ -209,9 +219,10 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.send("Septon demo connector v2 is running. MCP endpoint: /mcp · Ledger: /api/ledger"));
+app.get("/", (req, res) => res.send("Septon demo connector v3 is running. MCP endpoint: /mcp · Ledger: /api/ledger"));
 app.get("/api/ledger", (req, res) => res.json({ count: BASE_COUNT + ledger.length, entries: ledger }));
-app.post("/api/reset", (req, res) => { ledger = []; seq = 1; res.json({ ok: true }); });
+app.post("/api/reset", (req, res) => { ledger = []; seq = 1; draft = null; res.json({ ok: true }); });
+app.get("/api/draft", (req, res) => res.json({ draft }));
 
 app.post("/mcp", async (req, res) => {
   try {
