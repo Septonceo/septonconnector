@@ -101,7 +101,7 @@ function buildServer(key = "claude") {
   const S = SOURCES[key] || SOURCES.claude;
   const server = new McpServer({ name: "septon", version: "4.0.0" });
   const getDraft = () => drafts[key];
-  const step = (label) => { const d = getDraft(); if (d) d.trail.push({ time: new Date().toISOString(), label }); };
+  const step = (label) => { const d = getDraft(); if (d) d.trail.push({ time: new Date().toISOString(), label: /^(Asked|Linked|Signed)/.test(label) ? label : label + ' · in ' + S.source, source: S.source, person: S.person }); };
 
   server.tool("ask_septon",
     "Answer a business question from the enterprise Context Graph (Septon). Use for ANY business, operational or financial question. Returns the cause, ranked options with value, council result, policy check and a Decision Ledger ID.",
@@ -191,10 +191,16 @@ function buildServer(key = "claude") {
       if (draft) { e = addEntry({ kind: "Decision", source: S.source, person: S.person, role: S.role, topic, related, title: draft.title, question: draft.question, answer: draft.answer, options: draft.options, trail: draft.trail, montecarlo: draft.montecarlo }); delete drafts[key]; }
       else e = (id && ledger.find((x) => x.id === id)) || ledger.find((x) => x.kind === "Decision");
       if (!e) e = addEntry({ kind: "Decision", source: S.source, person: S.person, topic, related, title: CLAIMS.title, question: "", answer: CLAIMS.answer, options: CLAIMS.options, trail: [] });
-      related.slice().reverse().forEach((r) => { if (r.source !== S.source) e.trail.unshift({ time: r.time, label: 'Linked — ' + r.person + "'s " + r.source + ' analysis · ' + r.title }); });
+      // One decision, one trace: fold every other tool's deliberation on this topic into the record
+      const merged = [...(e.trail || [])];
+      Object.keys(drafts).forEach((k) => { const d = drafts[k]; if (k !== key && d && d.topic === topic) { merged.push(...d.trail); delete drafts[k]; } });
+      e.trail = merged.sort((a, b) => new Date(a.time) - new Date(b.time));
+      e.tools = [...new Set([S.source, ...related.map((r) => r.source)])];
+      ledger.forEach((x) => { if (x.topic === topic && x.kind === "Analysis") x.partOf = e.id; });
       (e.trail = e.trail || []).push({ time: new Date().toISOString(), label: 'Signed — ' + who + (chosen_option ? ' · chose: ' + chosen_option : '') + (rationale ? ' · "' + rationale + '"' : '') });
       e.status = "Accepted"; e.signer = who; if (chosen_option) e.chosen = chosen_option; if (rationale) e.rationale = rationale; e.time = new Date().toISOString();
       const others = related.filter((r) => r.source !== S.source);
+      e.stepCount = e.trail.length;
       return text(`✓ Logged to the Septon Decision Ledger · ${e.id} · source: ${S.source} · signed by ${e.signer} · topic: ${topic}${others.length ? ` · linked ${others.length} analyses from ${[...new Set(others.map((o) => o.source))].join(" and ")}` : ""} · hash ${e.hash} · ${e.trail.length} deliberation steps captured${e.montecarlo ? ` · Monte Carlo P50 ${M(e.montecarlo.p50)} attached` : ""} · replayable.`);
     });
 
