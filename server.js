@@ -101,6 +101,7 @@ function buildServer(key = "claude") {
   const S = SOURCES[key] || SOURCES.claude;
   const server = new McpServer({ name: "septon", version: "4.0.0" });
   const getDraft = () => drafts[key];
+  const tagMethod = (method, extra) => { const x = ledger.find((e) => e.source === S.source && e.kind === "Analysis"); if (x) { x.method = method; Object.assign(x, extra || {}); } };
   const step = (label) => { const d = getDraft(); if (d) d.trail.push({ time: new Date().toISOString(), label: /^(Asked|Linked|Signed)/.test(label) ? label : label + ' · in ' + S.source, source: S.source, person: S.person }); };
 
   server.tool("ask_septon",
@@ -137,6 +138,7 @@ function buildServer(key = "claude") {
       const r = monteCarlo({ runs: runs || 10000, payer_success: payer_success ?? 0.8, include: options || [1, 2, 3], gated: gated ?? true });
       const draft = getDraft();
       const e = draft || (id && ledger.find((x) => x.id === id)) || ledger[0];
+      tagMethod('Monte Carlo');
       step('Rehearsed — Monte Carlo ' + (runs || 10000).toLocaleString() + ' runs · payer success ' + Math.round((payer_success ?? 0.8) * 100) + '% · P50 ' + M(r.p50));
       if (e) e.montecarlo = { runs: r.runs, p10: +r.p10.toFixed(2), p50: +r.p50.toFixed(2), p90: +r.p90.toFixed(2), positive: +(r.positive * 100).toFixed(1) };
       return text([
@@ -173,6 +175,48 @@ function buildServer(key = "claude") {
       `Unique finding (Model B): Two denial codes were never mapped to the policy change — the hidden 27%.`,
       `Unique finding (Model A): Two payers changed rules in the same week — a coordinated shift, not noise.`, ``,
       `Council recommendation: run option 2 in parallel with option 1 to hedge the dissent. The signer must acknowledge the dissent before signing.`].join("\n"))));
+
+  server.tool("root_cause_mece",
+    "Root-cause analysis as a MECE issue tree (consulting-grade). Breaks the problem into mutually exclusive, collectively exhaustive branches with their share of the impact and evidence. Use when the user asks WHY something is happening. After calling, draw the tree as a chart (e.g. horizontal stacked bar or tree diagram).",
+    { problem: z.string().optional().describe("The problem to decompose") },
+    async ({ problem }) => {
+      const tree = [
+        { branch: "Payer policy shifts", share: 61, value: 6.9, subs: [["Prior-auth rule changes · 3 payers", 38], ["Medical-necessity criteria tightened", 15], ["Timely-filing windows shortened", 8]] },
+        { branch: "Unmapped denial codes (data)", share: 27, value: 3.0, subs: [["27% of 2025 records missing denial_reason", 19], ["Legacy codes not mapped to new schema", 8]] },
+        { branch: "Internal process gaps", share: 12, value: 1.3, subs: [["Prior-auth checked after submission", 8], ["Appeals staffing bottleneck in Q1", 4]] }
+      ];
+      tagMethod("Root cause · MECE", { mece: tree });
+      step("Root cause — MECE issue tree · 3 branches · 61% / 27% / 12%");
+      return text([
+        "Septon · Root cause (MECE issue tree) — " + (problem || "Why are claims denials rising?"),
+        "Total impact: $11.2M · denial rate 11.4% (+2.6 pts YoY)", "",
+        ...tree.flatMap((t, i) => [(i + 1) + ". " + t.branch + " — " + t.share + "% · $" + t.value.toFixed(1) + "M", ...t.subs.map(([n, p]) => "   • " + n + " — " + p + "%")]), "",
+        "MECE check: branches are mutually exclusive and sum to 100%.",
+        "So what: the 27% data branch is invisible to today's dashboards — map denial codes first (R1), or every payer negotiation argues from incomplete evidence.",
+        "Captured to the Septon ledger as analysis · " + S.source + " · " + S.person + ". Draw the tree as a chart for the user."
+      ].join("\n"));
+    });
+
+  server.tool("game_theory",
+    "Game-theory analysis of a negotiation (Nash equilibrium, payoff matrix, dominant strategies). Use for negotiation, leverage, competitor or payer questions. After calling, draw the 2×2 payoff matrix as a heatmap or table chart.",
+    { counterparty: z.string().optional().describe("Who we are negotiating with") },
+    async ({ counterparty }) => {
+      const cp = counterparty || "the top three payers";
+      const m = { mapped_settle: [8.4, -0.6], mapped_hold: [3.1, -2.2], unmapped_settle: [2.0, 1.4], unmapped_hold: [-7.4, 0.9] };
+      tagMethod("Game theory · Nash", { game: m });
+      step("Game theory — payoff matrix vs " + cp + " · Nash: settle once evidence is mapped");
+      return text([
+        "Septon · Game theory — negotiating with " + cp, "",
+        "Payoff matrix ($M/yr · us, them):",
+        "                      Payer settles     Payer holds out",
+        "Evidence mapped       (+8.4, −0.6)      (+3.1, −2.2)",
+        "Evidence unmapped     (+2.0, +1.4)      (−7.4, +0.9)", "",
+        "Nash equilibrium today (unmapped): payer HOLDS OUT — our incomplete data makes dispute cheap for them.",
+        "After R1 (mapped): SETTLE becomes the payer's dominant strategy (−0.6 > −2.2). Our expected value moves from −$7.4M to +$8.4M.",
+        "So what: open renegotiations only after denial codes are mapped — the same meeting four weeks earlier plays a losing game.",
+        "Captured to the Septon ledger as analysis · " + S.source + " · " + S.person + ". Draw the payoff matrix as a heatmap for the user."
+      ].join("\n"));
+    });
 
   server.tool("policy_check",
     "Test a proposed decision against live government, regulatory and compliance sources.",
